@@ -1,12 +1,12 @@
 # Chroma compatibility issues, hacking per its documentation
 # https://docs.trychroma.com/troubleshooting#sqlite
-__import__("pysqlite3")
-import sys
-
-sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 from typing import List
-
+import time
+import os
 from tempfile import NamedTemporaryFile
+
+# Disable LangSmith tracing
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
 
 import chainlit as cl
 from chainlit.types import AskFileResponse
@@ -15,7 +15,7 @@ from chromadb.config import Settings
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.chat_models import ChatOpenAI
 from langchain.document_loaders import PDFPlumberLoader
-from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.schema import Document
 from langchain.schema.embeddings import Embeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -42,10 +42,13 @@ def process_file(*, file: AskFileResponse) -> List[Document]:
     if file.type != "application/pdf":
         raise TypeError("Only PDF files are supported")
 
-    with NamedTemporaryFile() as tempfile:
+    # Create a temporary file in the current working directory
+    with NamedTemporaryFile(delete=False, suffix='.pdf', dir='.') as tempfile:
         tempfile.write(file.content)
+        tempfile_path = tempfile.name
 
-        loader = PDFPlumberLoader(tempfile.name)
+    try:
+        loader = PDFPlumberLoader(tempfile_path)
         documents = loader.load()
 
         text_splitter = RecursiveCharacterTextSplitter(
@@ -60,6 +63,10 @@ def process_file(*, file: AskFileResponse) -> List[Document]:
             raise ValueError("PDF file parsing failed.")
 
         return docs
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(tempfile_path):
+            os.unlink(tempfile_path)
 
 
 def create_search_engine(
@@ -89,14 +96,25 @@ def create_search_engine(
     search_engine = Chroma(client=client, client_settings=client_settings)
     search_engine._client.reset()
 
-    search_engine = Chroma.from_documents(
-        client=client,
-        documents=docs,
-        embedding=embeddings,
-        client_settings=client_settings,
-    )
-
-    return search_engine
+    # Add retry logic for creating the search engine
+    max_retries = 3
+    retry_delay = 5  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            search_engine = Chroma.from_documents(
+                client=client,
+                documents=docs,
+                embedding=embeddings,
+                client_settings=client_settings,
+            )
+            return search_engine
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"Attempt {attempt + 1} failed: {str(e)}. Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                raise Exception(f"Failed to create search engine after {max_retries} attempts: {str(e)}")
 
 
 @cl.on_chat_start
@@ -122,24 +140,32 @@ async def on_chat_start():
     await msg.send()
     docs = process_file(file=file)
     cl.user_session.set("docs", docs)
-    msg.content = f"`{file.name}` processed. Loading ..."
+    msg.content = f"`{file.name}` processed. Loading embeddings..."
     await msg.update()
 
-    # Index documents into search engine
-    embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
+    # Use local embeddings instead of OpenAI embeddings
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"}
+    )
+    
     try:
         search_engine = await cl.make_async(create_search_engine)(
             docs=docs, embeddings=embeddings
         )
     except Exception as e:
-        await cl.Message(content=f"Error: {e}").send()
-        raise SystemError
+        error_msg = f"Error creating search engine: {str(e)}\nPlease try again."
+        await cl.Message(content=error_msg).send()
+        return
+
     msg.content = f"`{file.name}` loaded. You can now ask questions!"
     await msg.update()
 
-    # RAG Chain
+    # RAG Chain with updated model
     llm = ChatOpenAI(
-        model="gpt-3.5-turbo-16k-0613", temperature=0, streaming=True
+        model="gpt-3.5-turbo",  # Using the latest stable version
+        temperature=0.5,
+        streaming=True
     )
     chain = RetrievalQAWithSourcesChain.from_chain_type(
         llm=llm,
